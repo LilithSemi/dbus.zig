@@ -226,7 +226,7 @@ test "Introspect emits XML for the registered interfaces" {
     try testing.expect(std.mem.indexOf(u8, xml, "org.freedesktop.DBus.Introspectable") != null);
 }
 
-var test_version: u32 = 42;
+const test_version: u32 = 42;
 
 fn versionGetter(ctx: ?*anyopaque, w: *marshal.Writer) HandlerError!void {
     _ = ctx;

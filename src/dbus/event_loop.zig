@@ -103,6 +103,9 @@ pub const EventLoop = struct {
             }
         }
         if (self.dispatch_depth > 0) {
+            // Freeing now would be a use-after-free: dispatch still holds `src`.
+            // If queuing the deferred free OOMs, deliberately leak this one
+            // Source rather than corrupt the in-progress dispatch.
             self.to_free.append(self.gpa, src) catch {};
         } else {
             self.gpa.destroy(src);

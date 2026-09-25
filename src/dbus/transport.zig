@@ -155,8 +155,12 @@ pub const Transport = struct {
         if (msg.controllen >= cmsg_hdr_space) {
             const hdr: *const linux.cmsghdr = @ptrCast(@alignCast(&cmsg_buf));
             if (hdr.level == linux.SOL.SOCKET and hdr.type == linux.SCM.RIGHTS) {
-                const data_len = hdr.len - cmsg_hdr_space;
-                const count = data_len / @sizeOf(i32);
+                // hdr.len is kernel-reported, but guard it: a value below the
+                // header size would underflow, and one past our buffer would
+                // slice out of bounds. Clamp to what cmsg_buf actually holds.
+                const data_len = std.math.sub(usize, hdr.len, cmsg_hdr_space) catch return Error.Unexpected;
+                const avail = cmsg_buf.len - cmsg_hdr_space;
+                const count = @min(data_len, avail) / @sizeOf(i32);
                 const fd_bytes = cmsg_buf[cmsg_hdr_space .. cmsg_hdr_space + count * @sizeOf(i32)];
                 const take = @min(count, fd_out.len);
                 @memcpy(std.mem.sliceAsBytes(fd_out[0..take]), fd_bytes[0 .. take * @sizeOf(i32)]);

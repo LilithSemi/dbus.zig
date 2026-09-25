@@ -29,24 +29,14 @@ fn appendHex(gpa: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8)
     }
 }
 
-fn hexVal(c: u8) ?u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'f' => c - 'a' + 10,
-        'A'...'F' => c - 'A' + 10,
-        else => null,
-    };
-}
-
 fn decodeHex(gpa: std.mem.Allocator, hex: []const u8) Error![]u8 {
     if (hex.len % 2 != 0) return Error.MalformedData;
     const out = try gpa.alloc(u8, hex.len / 2);
     errdefer gpa.free(out);
-    var i: usize = 0;
-    while (i < out.len) : (i += 1) {
-        const hi = hexVal(hex[i * 2]) orelse return Error.MalformedData;
-        const lo = hexVal(hex[i * 2 + 1]) orelse return Error.MalformedData;
-        out[i] = hi << 4 | lo;
+    for (out, 0..) |*b, i| {
+        const hi = std.fmt.charToDigit(hex[i * 2], 16) catch return Error.MalformedData;
+        const lo = std.fmt.charToDigit(hex[i * 2 + 1], 16) catch return Error.MalformedData;
+        b.* = hi << 4 | lo;
     }
     return out;
 }
@@ -60,6 +50,9 @@ pub const Client = struct {
     cookie_dir: ?[]const u8 = null,
     /// Fixed client challenge for deterministic tests; null means random.
     fixed_client_challenge: ?[]const u8 = null,
+    /// Injected I/O handle. Its entropy source backs the DBUS_COOKIE_SHA1 client
+    /// challenge; EXTERNAL and ANONYMOUS do not touch it.
+    io: std.Io,
 
     guid: ?[]u8 = null,
     fds_agreed: bool = false,
@@ -78,6 +71,7 @@ pub const Client = struct {
         switch (self.mechanism) {
             .external => {
                 try out.appendSlice(self.gpa, "AUTH EXTERNAL ");
+                // A u32 is at most 10 decimal digits, so 16 bytes always fits.
                 var buf: [16]u8 = undefined;
                 const uidstr = std.fmt.bufPrint(&buf, "{d}", .{self.uid}) catch unreachable;
                 try appendHex(self.gpa, out, uidstr);
@@ -88,6 +82,7 @@ pub const Client = struct {
             },
             .dbus_cookie_sha1 => {
                 try out.appendSlice(self.gpa, "AUTH DBUS_COOKIE_SHA1 ");
+                // A u32 is at most 10 decimal digits, so 16 bytes always fits.
                 var buf: [16]u8 = undefined;
                 const uidstr = std.fmt.bufPrint(&buf, "{d}", .{self.uid}) catch unreachable;
                 try appendHex(self.gpa, out, uidstr);
@@ -148,7 +143,7 @@ pub const Client = struct {
     }
 
     fn fail(self: *Client, out: *std.ArrayList(u8)) Error!Status {
-        out.appendSlice(self.gpa, "CANCEL\r\n") catch {};
+        try out.appendSlice(self.gpa, "CANCEL\r\n");
         self.state = .failed;
         return .failed;
     }
@@ -169,15 +164,9 @@ pub const Client = struct {
         var challenge_buf: [32]u8 = undefined;
         const client_challenge: []const u8 = if (self.fixed_client_challenge) |c| c else blk: {
             var raw: [16]u8 = undefined;
-            const got = linux.getrandom(&raw, raw.len, 0);
-            if (posix.errno(got) != .SUCCESS or got != raw.len) return Error.ReadFailed;
-            var w: usize = 0;
-            for (raw) |b| {
-                challenge_buf[w] = hexchars[b >> 4];
-                challenge_buf[w + 1] = hexchars[b & 0xf];
-                w += 2;
-            }
-            break :blk challenge_buf[0..w];
+            self.io.randomSecure(&raw) catch return Error.ReadFailed;
+            challenge_buf = std.fmt.bytesToHex(raw, .lower);
+            break :blk &challenge_buf;
         };
 
         try appendCookieResponse(self.gpa, out, server_challenge, client_challenge, cookie);
@@ -247,14 +236,13 @@ pub fn appendCookieResponse(
     try out.appendSlice(gpa, "\r\n");
 }
 
-/// Fill `buf` with a 32-char lowercase-hex server GUID from 16 random bytes.
-pub fn genGuid(buf: *[32]u8) void {
+/// Fill `buf` with a 32-char lowercase-hex server GUID from 16 secure random
+/// bytes. Entropy comes from the injected `io` handle rather than a hardwired
+/// syscall; `randomSecure` errors instead of silently returning weak bytes.
+pub fn genGuid(io: std.Io, buf: *[32]u8) std.Io.RandomSecureError!void {
     var raw: [16]u8 = undefined;
-    _ = linux.getrandom(&raw, raw.len, 0);
-    for (raw, 0..) |b, i| {
-        buf[i * 2] = hexchars[b >> 4];
-        buf[i * 2 + 1] = hexchars[b & 0xf];
-    }
+    try io.randomSecure(&raw);
+    buf.* = std.fmt.bytesToHex(raw, .lower);
 }
 
 /// Server side of the SASL handshake. Fed one CRLF-stripped client line at a
@@ -271,9 +259,9 @@ pub const Server = struct {
 
     const State = enum { waiting_auth, waiting_begin, done, failed };
 
-    pub fn init(gpa: std.mem.Allocator, peer_uid: ?u32) Server {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, peer_uid: ?u32) std.Io.RandomSecureError!Server {
         var s = Server{ .gpa = gpa, .guid = undefined, .peer_uid = peer_uid };
-        genGuid(&s.guid);
+        try genGuid(io, &s.guid);
         return s;
     }
 
@@ -341,9 +329,12 @@ fn stripCrlf(s: []const u8) []const u8 {
 }
 
 test "client and server complete an EXTERNAL handshake" {
-    var client = Client{ .gpa = testing.allocator, .uid = 1000, .mechanism = .external };
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
+    const io = iot.io();
+    var client = Client{ .gpa = testing.allocator, .uid = 1000, .mechanism = .external, .io = io };
     defer client.deinit();
-    var server = Server.init(testing.allocator, 1000);
+    var server = try Server.init(testing.allocator, io, 1000);
 
     var cout: std.ArrayList(u8) = .empty;
     defer cout.deinit(testing.allocator);
@@ -368,7 +359,9 @@ test "client and server complete an EXTERNAL handshake" {
 }
 
 test "server rejects EXTERNAL with a mismatched uid" {
-    var server = Server.init(testing.allocator, 1000);
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
+    var server = try Server.init(testing.allocator, iot.io(), 1000);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     // hex("2000") = 32303030
@@ -377,7 +370,9 @@ test "server rejects EXTERNAL with a mismatched uid" {
 }
 
 test "EXTERNAL handshake produces AUTH then BEGIN" {
-    var client = Client{ .gpa = testing.allocator, .uid = 1000, .mechanism = .external };
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
+    var client = Client{ .gpa = testing.allocator, .uid = 1000, .mechanism = .external, .io = iot.io() };
     defer client.deinit();
 
     var out: std.ArrayList(u8) = .empty;
@@ -395,7 +390,9 @@ test "EXTERNAL handshake produces AUTH then BEGIN" {
 }
 
 test "EXTERNAL with fd negotiation" {
-    var client = Client{ .gpa = testing.allocator, .uid = 0, .mechanism = .external, .negotiate_fd = true };
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
+    var client = Client{ .gpa = testing.allocator, .uid = 0, .mechanism = .external, .negotiate_fd = true, .io = iot.io() };
     defer client.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
@@ -412,7 +409,9 @@ test "EXTERNAL with fd negotiation" {
 }
 
 test "REJECTED yields rejected status" {
-    var client = Client{ .gpa = testing.allocator, .uid = 1000, .mechanism = .external };
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
+    var client = Client{ .gpa = testing.allocator, .uid = 1000, .mechanism = .external, .io = iot.io() };
     defer client.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
@@ -474,12 +473,15 @@ test "DBUS_COOKIE_SHA1 full handshake reads the keyring and answers" {
     try writeFileRaw(path_z, "42 1700000000 abc123\n");
     defer _ = linux.unlinkat(linux.AT.FDCWD, path_z, 0);
 
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
     var client = Client{
         .gpa = testing.allocator,
         .uid = 1000,
         .mechanism = .dbus_cookie_sha1,
         .cookie_dir = "/tmp",
         .fixed_client_challenge = "cccccccc",
+        .io = iot.io(),
     };
     defer client.deinit();
 

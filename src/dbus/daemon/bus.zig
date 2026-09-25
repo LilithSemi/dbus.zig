@@ -59,6 +59,7 @@ pub const Client = struct {
 pub const Daemon = struct {
     gpa: std.mem.Allocator,
     loop: *el.EventLoop,
+    io: std.Io,
     guid: [32]u8,
     listen_fd: i32 = -1,
     listen_source: ?*el.Source = null,
@@ -70,11 +71,17 @@ pub const Daemon = struct {
     config: ?config_mod.Config = null,
     policy: policy_mod.PolicySet = .{},
     services: activation.ServiceRegistry,
+    /// Count of best-effort deliveries dropped and setups rejected under fault
+    /// (a peer's socket full or gone, an OOM releasing names, a client that
+    /// authenticated but failed to register). Dead peers are reaped in
+    /// reapDisconnected; this keeps the drops observable, not silently swallowed.
+    dropped_sends: u64 = 0,
 
-    pub fn init(gpa: std.mem.Allocator, loop: *el.EventLoop) !*Daemon {
+    pub fn init(gpa: std.mem.Allocator, loop: *el.EventLoop, io: std.Io) !*Daemon {
         const self = try gpa.create(Daemon);
-        self.* = .{ .gpa = gpa, .loop = loop, .guid = undefined, .registry = NameRegistry.init(gpa), .services = activation.ServiceRegistry.init(gpa) };
-        auth.genGuid(&self.guid);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .loop = loop, .io = io, .guid = undefined, .registry = NameRegistry.init(gpa), .services = activation.ServiceRegistry.init(gpa) };
+        try auth.genGuid(io, &self.guid);
         return self;
     }
 
@@ -116,6 +123,8 @@ pub const Daemon = struct {
 
         var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
         const off = @offsetOf(linux.sockaddr.un, "path");
+        // The path plus its NUL (or leading abstract NUL) must fit sun_path.
+        if (path.len + 1 > addr.path.len) return Error.ListenFailed;
         var namelen: usize = off;
         if (abstract) {
             addr.path[0] = 0;
@@ -149,9 +158,12 @@ pub const Daemon = struct {
     fn reapDisconnected(self: *Daemon) void {
         var dead: std.ArrayList(ConnId) = .empty;
         defer dead.deinit(self.gpa);
+        // At most one entry per client, so reserve once and the appends below
+        // cannot fail or realloc.
+        dead.ensureTotalCapacity(self.gpa, self.clients.count()) catch return;
         var it = self.clients.valueIterator();
         while (it.next()) |cptr| {
-            if (cptr.*.conn.disconnected) dead.append(self.gpa, cptr.*.id) catch {};
+            if (cptr.*.conn.disconnected) dead.appendAssumeCapacity(cptr.*.id);
         }
         for (dead.items) |id| self.dropClient(id);
     }
@@ -163,7 +175,11 @@ pub const Daemon = struct {
         var changes: std.ArrayList(names.OwnerChange) = .empty;
         defer changes.deinit(self.gpa);
         defer for (changes.items) |ch| self.gpa.free(ch.name);
-        self.registry.releaseAll(id, &changes) catch {};
+        // On OOM some names go unreleased and their NameOwnerChanged is skipped;
+        // count it so the loss of a signal is observable.
+        self.registry.releaseAll(id, &changes) catch {
+            self.dropped_sends += 1;
+        };
         for (changes.items) |ch| {
             const new_name = if (ch.new_owner) |n| (if (self.clients.get(n)) |c| c.unique_name else "") else "";
             self.emitNameOwnerChanged(ch.name, client.unique_name, new_name);
@@ -190,14 +206,21 @@ pub const Daemon = struct {
 
         var leftover: std.ArrayList(u8) = .empty;
         defer leftover.deinit(self.gpa);
-        var server = auth.Server.init(self.gpa, cred.uid);
+        var server = auth.Server.init(self.gpa, self.io, cred.uid) catch {
+            _ = linux.close(fd);
+            return;
+        };
         runServerAuth(self.gpa, fd, &server, &leftover) catch {
             _ = linux.close(fd);
             return;
         };
 
-        // addClient takes ownership of fd and closes it on any error path.
-        self.addClient(fd, cred.uid, cred.pid, leftover.items) catch {};
+        // addClient takes ownership of fd and closes it on any error path. A
+        // failure here (OOM, fd exhaustion) drops the just-authenticated peer;
+        // count it so a spike is visible rather than silent.
+        self.addClient(fd, cred.uid, cred.pid, leftover.items) catch {
+            self.dropped_sends += 1;
+        };
     }
 
     fn addClient(self: *Daemon, fd: i32, uid: u32, pid: i32, leftover: []const u8) !void {
@@ -253,7 +276,7 @@ pub const Daemon = struct {
         return self.clients.get(id);
     }
 
-    fn clientFilter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) conn_mod.FilterResult {
+    fn clientFilter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) conn_mod.Error!conn_mod.FilterResult {
         const client: *Client = @ptrCast(@alignCast(ctx.?));
         client.daemon.handleMessage(client, conn, msg);
         return .handled;
@@ -264,7 +287,9 @@ pub const Daemon = struct {
         const to_driver = if (msg.destination) |d| std.mem.eql(u8, d, "org.freedesktop.DBus") else false;
         if (to_driver) {
             _ = conn;
-            driver.handle(self, client, msg) catch {};
+            driver.handle(self, client, msg) catch {
+                self.dropped_sends += 1;
+            };
             return;
         }
         // Signals with no destination broadcast to matching clients.
@@ -294,7 +319,12 @@ pub const Daemon = struct {
         // Preserve the original sender's serial so the reply's reply_serial still
         // matches the caller's pending call; stamp the authenticated sender.
         m.sender = from.unique_name;
-        _ = target.conn.sendMessage(m) catch {};
+        // Best-effort: a send fails if the peer's socket buffer is full or the
+        // peer died. Dead peers are reaped in reapDisconnected via
+        // conn.disconnected; here we only record the dropped delivery.
+        _ = target.conn.sendMessage(m) catch {
+            self.dropped_sends += 1;
+        };
     }
 
     /// Broadcast a signal to every client (except the sender) whose match rules
@@ -312,7 +342,9 @@ pub const Daemon = struct {
                 if (local.matches(&m)) {
                     var send_m = m;
                     send_m.serial = 0;
-                    _ = c.conn.sendMessage(send_m) catch {};
+                    _ = c.conn.sendMessage(send_m) catch {
+                        self.dropped_sends += 1;
+                    };
                     break;
                 }
             }
@@ -335,7 +367,9 @@ pub const Daemon = struct {
             .body_signature = "s",
             .body = body.items,
         };
-        _ = to.conn.sendMessage(err) catch {};
+        _ = to.conn.sendMessage(err) catch {
+            self.dropped_sends += 1;
+        };
     }
 
     /// Broadcast org.freedesktop.DBus.NameOwnerChanged(name, old, new) to every
@@ -371,7 +405,9 @@ pub const Daemon = struct {
                 if (local.matches(sig)) {
                     var m = sig.*;
                     m.serial = 0;
-                    _ = c.conn.sendMessage(m) catch {};
+                    _ = c.conn.sendMessage(m) catch {
+                        self.dropped_sends += 1;
+                    };
                     break;
                 }
             }
@@ -395,7 +431,9 @@ pub const Daemon = struct {
             .body_signature = "s",
             .body = body.items,
         };
-        _ = client.conn.sendMessage(sig) catch {};
+        _ = client.conn.sendMessage(sig) catch {
+            self.dropped_sends += 1;
+        };
     }
 };
 
@@ -468,10 +506,10 @@ fn daemonThread(d: *Daemon) void {
 /// Connect with retries: under parallel test binaries the daemon thread can be
 /// starved long enough for the one-shot Hello to time out (the documented
 /// blocking-auth limitation), so retry to keep these tests reliable.
-fn connectRetry(loop: *el.EventLoop, sock: []const u8, uid: u32) !*client_mod.Bus {
+fn connectRetry(loop: *el.EventLoop, io: std.Io, sock: []const u8, uid: u32) !*client_mod.Bus {
     var attempt: usize = 0;
     while (attempt < 20) : (attempt += 1) {
-        if (client_mod.Bus.connectUnix(testing.allocator, loop, sock, true, uid)) |b| {
+        if (client_mod.Bus.connectUnix(testing.allocator, loop, io, sock, true, uid)) |b| {
             return b;
         } else |_| {}
     }
@@ -558,7 +596,9 @@ test "our client connects to our daemon and Hello works" {
 
     var dloop = try el.EventLoop.init(dgpa);
     defer dloop.deinit();
-    const d = try Daemon.init(dgpa, &dloop);
+    var diot: std.Io.Threaded = .init(dgpa, .{});
+    defer diot.deinit();
+    const d = try Daemon.init(dgpa, &dloop, diot.io());
     defer d.deinit();
 
     // Unique abstract socket name for this test run.
@@ -574,7 +614,9 @@ test "our client connects to our daemon and Hello works" {
 
     var cloop = try el.EventLoop.init(testing.allocator);
     defer cloop.deinit();
-    const client_bus = try connectRetry(&cloop, sock, linux.getuid());
+    var ciot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer ciot.deinit();
+    const client_bus = try connectRetry(&cloop, ciot.io(), sock, linux.getuid());
     defer client_bus.deinit();
 
     const uname = client_bus.unique_name.?;
@@ -589,7 +631,9 @@ test "two clients route a call and a signal through our daemon" {
 
     var dloop = try el.EventLoop.init(dgpa);
     defer dloop.deinit();
-    const d = try Daemon.init(dgpa, &dloop);
+    var diot: std.Io.Threaded = .init(dgpa, .{});
+    defer diot.deinit();
+    const d = try Daemon.init(dgpa, &dloop, diot.io());
     defer d.deinit();
 
     var name_buf: [64]u8 = undefined;
@@ -603,10 +647,12 @@ test "two clients route a call and a signal through our daemon" {
 
     var cloop = try el.EventLoop.init(testing.allocator);
     defer cloop.deinit();
+    var ciot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer ciot.deinit();
     const uid = linux.getuid();
-    const a = try connectRetry(&cloop, sock, uid);
+    const a = try connectRetry(&cloop, ciot.io(), sock, uid);
     defer a.deinit();
-    const b = try connectRetry(&cloop, sock, uid);
+    const b = try connectRetry(&cloop, ciot.io(), sock, uid);
     defer b.deinit();
 
     // A exports an Echo object and claims a well-known name.
@@ -704,7 +750,9 @@ test "policy denies owning a reserved name" {
 
     var dloop = try el.EventLoop.init(dgpa);
     defer dloop.deinit();
-    const d = try Daemon.init(dgpa, &dloop);
+    var diot: std.Io.Threaded = .init(dgpa, .{});
+    defer diot.deinit();
+    const d = try Daemon.init(dgpa, &dloop, diot.io());
     defer d.deinit();
 
     const cfg = try config_mod.parse(dgpa,
@@ -728,7 +776,9 @@ test "policy denies owning a reserved name" {
 
     var cloop = try el.EventLoop.init(testing.allocator);
     defer cloop.deinit();
-    const a = try connectRetry(&cloop, sock, linux.getuid());
+    var ciot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer ciot.deinit();
+    const a = try connectRetry(&cloop, ciot.io(), sock, linux.getuid());
     defer a.deinit();
 
     var denied = ResultCatcher{};

@@ -27,10 +27,7 @@ pub const Type = enum(u8) {
 
 /// Map a raw signature byte to a `Type`, or null if it is not a valid code.
 pub fn fromCode(c: u8) ?Type {
-    return switch (c) {
-        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 'h', 's', 'o', 'g', 'a', 'v', '(', ')', '{', '}' => @enumFromInt(c),
-        else => null,
-    };
+    return std.enums.fromInt(Type, c);
 }
 
 /// Wire alignment of a type in bytes. Containers align by their opening token

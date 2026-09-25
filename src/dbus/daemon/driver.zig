@@ -250,15 +250,19 @@ fn removeMatch(d: *Daemon, client: *Client, msg: *const Message) Error!void {
     d.replyError(client, msg, "org.freedesktop.DBus.Error.MatchRuleNotFound", "no such rule");
 }
 
+/// StartServiceByName reply codes (org.freedesktop.DBus spec).
+const start_reply_success: u32 = 1;
+const start_reply_already_running: u32 = 2;
+
 fn startService(d: *Daemon, client: *Client, msg: *const Message) Error!void {
     const name = firstString(msg) orelse return d.replyError(client, msg, "org.freedesktop.DBus.Error.InvalidArgs", "bad args");
     if (d.resolve(name) != null) {
-        try replyU32(client, msg, 2); // DBUS_START_REPLY_ALREADY_RUNNING
+        try replyU32(client, msg, start_reply_already_running);
         return;
     }
     if (d.services.lookup(name)) |svc| {
         activation.spawn(d.gpa, svc.exec) catch return d.replyError(client, msg, "org.freedesktop.DBus.Error.Spawn.ExecFailed", "spawn failed");
-        try replyU32(client, msg, 1); // DBUS_START_REPLY_SUCCESS
+        try replyU32(client, msg, start_reply_success);
         return;
     }
     d.replyError(client, msg, "org.freedesktop.DBus.Error.ServiceUnknown", "service not found");

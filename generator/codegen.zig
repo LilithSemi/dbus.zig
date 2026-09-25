@@ -33,6 +33,8 @@ fn zigType(sig: []const u8) ?[]const u8 {
     };
 }
 
+/// Precondition: `sig` is a basic type code, guaranteed by `methodSupported`
+/// filtering unsupported args before any emit path reaches here.
 fn readerCall(sig: u8) []const u8 {
     return switch (sig) {
         'y' => "byte",
@@ -52,6 +54,8 @@ fn readerCall(sig: u8) []const u8 {
     };
 }
 
+/// Precondition: `sig` is a basic type code, guaranteed by `methodSupported`
+/// filtering unsupported args before any emit path reaches here.
 fn writerCall(sig: u8) []const u8 {
     return switch (sig) {
         'y' => "byte",

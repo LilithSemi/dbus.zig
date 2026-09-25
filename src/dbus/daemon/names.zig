@@ -101,7 +101,7 @@ pub const NameRegistry = struct {
         const entry = gop.value_ptr;
         const primary = entry.owners.items[0];
         if (primary.conn == conn) {
-            entry.owners.items[0].flags = flags; // refresh flags
+            entry.owners.items[0].flags = flags;
             return .{ .result = .already_owner };
         }
 

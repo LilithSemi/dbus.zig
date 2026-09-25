@@ -69,10 +69,10 @@ fn drive(loop: *EventLoop, flag: *const bool) void {
 /// Connect with a few retries: under parallel test binaries the daemon thread
 /// can be starved long enough for the one-shot Hello to time out (the known
 /// blocking-auth limitation). Retrying makes this generated-code test reliable.
-fn connectRetry(gpa: std.mem.Allocator, loop: *EventLoop, sock: []const u8, uid: u32) !*Bus {
+fn connectRetry(gpa: std.mem.Allocator, loop: *EventLoop, io: std.Io, sock: []const u8, uid: u32) !*Bus {
     var attempt: usize = 0;
     while (attempt < 20) : (attempt += 1) {
-        if (Bus.connectUnix(gpa, loop, sock, true, uid)) |bus| {
+        if (Bus.connectUnix(gpa, loop, io, sock, true, uid)) |bus| {
             return bus;
         } else |_| {}
     }
@@ -86,7 +86,9 @@ test "generated proxy and vtable round-trip through our daemon" {
 
     var dloop = try EventLoop.init(dgpa);
     defer dloop.deinit();
-    const d = try Daemon.init(dgpa, &dloop);
+    var diot: std.Io.Threaded = .init(dgpa, .{});
+    defer diot.deinit();
+    const d = try Daemon.init(dgpa, &dloop, diot.io());
     defer d.deinit();
 
     var name_buf: [64]u8 = undefined;
@@ -100,10 +102,12 @@ test "generated proxy and vtable round-trip through our daemon" {
 
     var cloop = try EventLoop.init(testing.allocator);
     defer cloop.deinit();
+    var ciot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer ciot.deinit();
     const uid = linux.getuid();
-    const a = try connectRetry(testing.allocator, &cloop, sock, uid);
+    const a = try connectRetry(testing.allocator, &cloop, ciot.io(), sock, uid);
     defer a.deinit();
-    const b = try connectRetry(testing.allocator, &cloop, sock, uid);
+    const b = try connectRetry(testing.allocator, &cloop, ciot.io(), sock, uid);
     defer b.deinit();
 
     // A exports the generated Calc vtable and claims the well-known name.

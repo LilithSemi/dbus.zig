@@ -23,8 +23,10 @@ pub const ReplyFn = *const fn (ctx: ?*anyopaque, conn: *Connection, reply: ?*con
 pub const FilterResult = enum { handled, pass };
 
 /// Called for messages that are not replies to a pending call (signals, incoming
-/// method calls). Return `.handled` to stop further filters.
-pub const FilterFn = *const fn (ctx: ?*anyopaque, conn: *Connection, msg: *const Message) FilterResult;
+/// method calls). Return `.handled` to stop further filters. A returned error is
+/// a fault handling this one message: `processIncoming` counts it and moves on,
+/// so a filter propagates faults with `try` instead of swallowing them.
+pub const FilterFn = *const fn (ctx: ?*anyopaque, conn: *Connection, msg: *const Message) Error!FilterResult;
 
 const Pending = struct { cb: ReplyFn, ctx: ?*anyopaque };
 const Filter = struct { cb: FilterFn, ctx: ?*anyopaque };
@@ -50,6 +52,9 @@ pub const Connection = struct {
     pending: std.AutoHashMapUnmanaged(u32, Pending) = .empty,
     filters: std.ArrayList(Filter) = .empty,
     disconnected: bool = false,
+    /// Messages a filter failed to handle (dispatch OOM, send failure). Counted
+    /// here, the single recovery point, rather than swallowed inside each filter.
+    filter_faults: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, t: Transport, loop: *el.EventLoop) Connection {
         return .{ .gpa = gpa, .transport = t, .loop = loop };
@@ -174,7 +179,11 @@ pub const Connection = struct {
             // closed right after, so a handler must dup one it wants to keep.
             const nfds = @min(msg.unix_fds orelse 0, self.fds_in.items.len);
             msg.fds = self.fds_in.items[0..nfds];
-            self.dispatch(&msg);
+            // A filter fault handling one message must not stop the stream or
+            // leak its fds: count it and fall through to the normal cleanup.
+            self.dispatch(&msg) catch {
+                self.filter_faults += 1;
+            };
             for (self.fds_in.items[0..nfds]) |fd| _ = linux.close(fd);
             const fd_rem = self.fds_in.items.len - nfds;
             std.mem.copyForwards(i32, self.fds_in.items[0..fd_rem], self.fds_in.items[nfds..]);
@@ -186,7 +195,7 @@ pub const Connection = struct {
         }
     }
 
-    fn dispatch(self: *Connection, msg: *const Message) void {
+    fn dispatch(self: *Connection, msg: *const Message) Error!void {
         if (msg.msg_type == .method_return or msg.msg_type == .error_) {
             if (msg.reply_serial) |rs| {
                 if (self.pending.fetchRemove(rs)) |kv| {
@@ -196,7 +205,7 @@ pub const Connection = struct {
             }
         }
         for (self.filters.items) |f| {
-            if (f.cb(f.ctx, self, msg) == .handled) return;
+            if (try f.cb(f.ctx, self, msg) == .handled) return;
         }
     }
 
@@ -225,11 +234,11 @@ fn socketpair() ![2]i32 {
 }
 
 const Echo = struct {
-    fn filter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) FilterResult {
+    fn filter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) Error!FilterResult {
         _ = ctx;
         if (msg.msg_type == .method_call) {
             const reply = Message{ .msg_type = .method_return, .serial = 0, .reply_serial = msg.serial };
-            _ = conn.sendMessage(reply) catch {};
+            _ = try conn.sendMessage(reply);
             return .handled;
         }
         return .pass;
@@ -273,7 +282,7 @@ test "two connections exchange a method call and its reply" {
 const FdCatcher = struct {
     got: bool = false,
     fd: i32 = -1,
-    fn filter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) FilterResult {
+    fn filter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) Error!FilterResult {
         _ = conn;
         const self: *FdCatcher = @ptrCast(@alignCast(ctx.?));
         if (msg.msg_type != .method_call) return .pass;

@@ -180,10 +180,10 @@ const echo_methods = [_]Method{.{ .name = "Echo", .handler = echoHandler }};
 
 const RegistryFilter = struct {
     registry: *Registry,
-    fn filter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) conn_mod.FilterResult {
+    fn filter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) conn_mod.Error!conn_mod.FilterResult {
         const self: *RegistryFilter = @ptrCast(@alignCast(ctx.?));
         if (msg.msg_type == .method_call) {
-            _ = self.registry.dispatch(conn, msg) catch {};
+            _ = try self.registry.dispatch(conn, msg);
             return .handled;
         }
         return .pass;

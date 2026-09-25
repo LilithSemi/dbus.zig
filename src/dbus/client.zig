@@ -48,10 +48,10 @@ pub const Bus = struct {
     /// Connect over a unix socket, authenticate as `uid` via EXTERNAL, and Hello.
     /// Returns a heap-allocated Bus (its address is stable, as the connection and
     /// callbacks hold pointers into it). Free with `deinit`.
-    pub fn connectUnix(gpa: std.mem.Allocator, loop: *el.EventLoop, path: []const u8, abstract: bool, uid: u32) Error!*Bus {
+    pub fn connectUnix(gpa: std.mem.Allocator, loop: *el.EventLoop, io: std.Io, path: []const u8, abstract: bool, uid: u32) Error!*Bus {
         var t = try Transport.connectUnix(path, abstract);
 
-        var ac = auth.Client{ .gpa = gpa, .uid = uid, .mechanism = .external };
+        var ac = auth.Client{ .gpa = gpa, .uid = uid, .mechanism = .external, .io = io };
         defer ac.deinit();
         var leftover: std.ArrayList(u8) = .empty;
         defer leftover.deinit(gpa);
@@ -151,11 +151,11 @@ pub const Bus = struct {
         return self.conn.sendMessage(signal);
     }
 
-    fn busFilter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) conn_mod.FilterResult {
+    fn busFilter(ctx: ?*anyopaque, conn: *Connection, msg: *const Message) conn_mod.Error!conn_mod.FilterResult {
         const self: *Bus = @ptrCast(@alignCast(ctx.?));
         switch (msg.msg_type) {
             .method_call => {
-                const handled = self.registry.dispatch(conn, msg) catch return .handled;
+                const handled = try self.registry.dispatch(conn, msg);
                 return if (handled) .handled else .pass;
             },
             .signal => {
@@ -281,7 +281,10 @@ test "connect to the running session bus, Hello and ListNames (interop)" {
     var loop = try el.EventLoop.init(testing.allocator);
     defer loop.deinit();
 
-    const bus = Bus.connectUnix(testing.allocator, &loop, path, false, uid) catch {
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
+
+    const bus = Bus.connectUnix(testing.allocator, &loop, iot.io(), path, false, uid) catch {
         return error.SkipZigTest;
     };
     defer bus.deinit();
@@ -344,7 +347,10 @@ test "export an object and call it via the bus routing back to us (interop)" {
     var loop = try el.EventLoop.init(testing.allocator);
     defer loop.deinit();
 
-    const bus = Bus.connectUnix(testing.allocator, &loop, path, false, uid) catch {
+    var iot: std.Io.Threaded = .init(testing.allocator, .{});
+    defer iot.deinit();
+
+    const bus = Bus.connectUnix(testing.allocator, &loop, iot.io(), path, false, uid) catch {
         return error.SkipZigTest;
     };
     defer bus.deinit();
