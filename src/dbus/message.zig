@@ -77,8 +77,11 @@ pub fn wireLength(prefix: []const u8) ?usize {
     };
     const body_len = std.mem.readInt(u32, prefix[4..8], endian);
     const fields_len = std.mem.readInt(u32, prefix[12..16], endian);
-    const header_len = std.mem.alignForward(usize, 16 + @as(usize, fields_len), 8);
-    return header_len + body_len;
+    // body_len and fields_len are attacker-controlled, so every add is checked:
+    // on a 32-bit usize target a plain + would wrap and frame a too-small buffer.
+    const fields_padded = std.math.add(usize, 16, fields_len) catch return null;
+    const header_len = std.mem.alignForward(usize, fields_padded, 8);
+    return std.math.add(usize, header_len, body_len) catch null;
 }
 
 pub const Message = struct {
