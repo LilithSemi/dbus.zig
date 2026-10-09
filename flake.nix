@@ -58,7 +58,7 @@
           default = pkgs.mkShell {
             name = "dbus-zig-dev-shell";
             packages = with pkgs; [
-              zig
+              zig_0_17
             ];
           };
         }
@@ -76,7 +76,7 @@
             src = lib.cleanSource ./.;
 
             nativeBuildInputs = with pkgs; [
-              zig
+              zig_0_17
             ];
 
             doCheck = true;

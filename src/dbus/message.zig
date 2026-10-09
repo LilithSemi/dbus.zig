@@ -125,7 +125,7 @@ pub const Message = struct {
             .little => 'l',
             .big => 'B',
         });
-        try w.byte(@intFromEnum(self.msg_type));
+        try w.byte(@backingInt(self.msg_type));
         try w.byte(@as(u8, @bitCast(self.flags)));
         try w.byte(protocol_version);
         try w.uint32(@intCast(self.body.len));
@@ -150,7 +150,7 @@ pub const Message = struct {
     fn writeStrField(w: *marshal.Writer, field: HeaderField, val: ?[]const u8) Error!void {
         const s = val orelse return;
         try w.beginStruct();
-        try w.byte(@intFromEnum(field));
+        try w.byte(@backingInt(field));
         const sig: []const u8 = if (field == .path) "o" else "s";
         try w.beginVariant(sig);
         try w.string(s);
@@ -159,7 +159,7 @@ pub const Message = struct {
     fn writeSigField(w: *marshal.Writer, field: HeaderField, val: ?[]const u8) Error!void {
         const s = val orelse return;
         try w.beginStruct();
-        try w.byte(@intFromEnum(field));
+        try w.byte(@backingInt(field));
         try w.beginVariant("g");
         try w.signatureStr(s);
     }
@@ -167,7 +167,7 @@ pub const Message = struct {
     fn writeU32Field(w: *marshal.Writer, field: HeaderField, val: ?u32) Error!void {
         const n = val orelse return;
         try w.beginStruct();
-        try w.byte(@intFromEnum(field));
+        try w.byte(@backingInt(field));
         try w.beginVariant("u");
         try w.uint32(n);
     }
@@ -288,7 +288,7 @@ test "serialize/deserialize round-trips big-endian" {
 
     // Fixed-header byte anchors: endianness 'B', type SIGNAL(4), version 1.
     try testing.expectEqual(@as(u8, 'B'), buf.items[0]);
-    try testing.expectEqual(@as(u8, @intFromEnum(MessageType.signal)), buf.items[1]);
+    try testing.expectEqual(@as(u8, @backingInt(MessageType.signal)), buf.items[1]);
     try testing.expectEqual(@as(u8, protocol_version), buf.items[3]);
     // Serial is a big-endian u32 at offset 8.
     try testing.expectEqual(@as(u32, 0x01020304), std.mem.readInt(u32, buf.items[8..12], .big));
@@ -314,7 +314,7 @@ test "deserialize enforces required fields" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     try msg.serialize(testing.allocator, &buf, .little);
-    buf.items[1] = @intFromEnum(MessageType.method_return);
+    buf.items[1] = @backingInt(MessageType.method_return);
     try testing.expectError(Error.MissingRequiredField, Message.deserialize(testing.allocator, buf.items));
 }
 

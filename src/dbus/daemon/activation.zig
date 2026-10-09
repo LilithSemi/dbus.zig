@@ -83,7 +83,7 @@ pub fn spawn(gpa: std.mem.Allocator, exec: []const u8) Error!void {
         args.deinit(gpa);
     }
     var it = std.mem.tokenizeScalar(u8, exec, ' ');
-    while (it.next()) |tok| try args.append(gpa, try gpa.dupeZ(u8, tok));
+    while (it.next()) |tok| try args.append(gpa, try gpa.dupeSentinel(u8, tok, 0));
     if (args.items.len == 0) return Error.SpawnFailed;
 
     const argv = try gpa.alloc(?[*:0]const u8, args.items.len + 1);
@@ -105,7 +105,7 @@ pub fn spawn(gpa: std.mem.Allocator, exec: []const u8) Error!void {
         linux.exit(0);
     }
     // Parent: reap the intermediate child (the grandchild is init's problem).
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     _ = linux.waitpid(@intCast(pid1), &status, 0);
 }
 

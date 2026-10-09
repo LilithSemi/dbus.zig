@@ -34,7 +34,7 @@ fn completeTypeLenDepth(sig: []const u8, array_depth: usize, struct_depth: usize
             if (struct_depth + 1 > max_depth) return Error.ExceededMaxDepth;
             var i: usize = 1;
             var count: usize = 0;
-            while (i < sig.len and sig[i] != @intFromEnum(Type.struct_end)) {
+            while (i < sig.len and sig[i] != @backingInt(Type.struct_end)) {
                 i += try completeTypeLenDepth(sig[i..], array_depth, struct_depth + 1);
                 count += 1;
             }
@@ -50,10 +50,10 @@ fn completeTypeLenDepth(sig: []const u8, array_depth: usize, struct_depth: usize
             const key = types.fromCode(sig[1]) orelse return Error.InvalidDictEntry;
             if (!types.isBasic(key)) return Error.InvalidDictEntry;
             // A dict-entry must have exactly one value type; reject a missing one.
-            if (sig[2] == @intFromEnum(Type.dict_end)) return Error.InvalidDictEntry;
+            if (sig[2] == @backingInt(Type.dict_end)) return Error.InvalidDictEntry;
             const val_len = try completeTypeLenDepth(sig[2..], array_depth, struct_depth + 1);
             const close = 2 + val_len;
-            if (close >= sig.len or sig[close] != @intFromEnum(Type.dict_end)) return Error.InvalidDictEntry;
+            if (close >= sig.len or sig[close] != @backingInt(Type.dict_end)) return Error.InvalidDictEntry;
             return close + 1; // include '}'
         },
         .struct_end, .dict_end => return Error.InvalidSignature,

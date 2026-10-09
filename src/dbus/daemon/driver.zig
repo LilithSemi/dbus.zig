@@ -143,7 +143,7 @@ fn requestName(d: *Daemon, client: *Client, msg: *const Message) Error!void {
         d.sendDirectedSignal(client, "NameAcquired", name);
         if (outcome.old_owner) |o| if (d.clients.get(o)) |oc| d.sendDirectedSignal(oc, "NameLost", name);
     }
-    try replyU32(client, msg, @intFromEnum(outcome.result));
+    try replyU32(client, msg, @backingInt(outcome.result));
 }
 
 fn releaseName(d: *Daemon, client: *Client, msg: *const Message) Error!void {
@@ -155,7 +155,7 @@ fn releaseName(d: *Daemon, client: *Client, msg: *const Message) Error!void {
         if (outcome.new_owner) |n| if (d.clients.get(n)) |nc| d.sendDirectedSignal(nc, "NameAcquired", name);
         d.sendDirectedSignal(client, "NameLost", name);
     }
-    try replyU32(client, msg, @intFromEnum(outcome.release_result));
+    try replyU32(client, msg, @backingInt(outcome.release_result));
 }
 
 fn listNames(d: *Daemon, client: *Client, msg: *const Message, activatable: bool) Error!void {
