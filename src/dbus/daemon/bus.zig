@@ -67,7 +67,9 @@ pub const Daemon = struct {
     clients: std.AutoHashMapUnmanaged(ConnId, *Client) = .empty,
     unique_map: std.StringHashMapUnmanaged(ConnId) = .empty,
     next_id: ConnId = 0,
-    running: bool = true,
+    /// The session owner may stop a daemon running on another thread. Keep
+    /// this atomic so shutdown has a defined cross-thread happens-before edge.
+    running: std.atomic.Value(bool) = .init(true),
     config: ?config_mod.Config = null,
     policy: policy_mod.PolicySet = .{},
     services: activation.ServiceRegistry,
@@ -143,14 +145,14 @@ pub const Daemon = struct {
     }
 
     pub fn run(self: *Daemon) void {
-        while (self.running) {
+        while (self.running.load(.acquire)) {
             _ = self.loop.dispatch(100);
             self.reapDisconnected();
         }
     }
 
     pub fn stop(self: *Daemon) void {
-        self.running = false;
+        self.running.store(false, .release);
     }
 
     /// Remove clients whose connection dropped, releasing their names and
