@@ -11,6 +11,7 @@ const posix = std.posix;
 pub const Error = error{
     SocketFailed,
     ConnectFailed,
+    Timeout,
     WouldBlock,
     Interrupted,
     ConnectionReset,
@@ -19,6 +20,9 @@ pub const Error = error{
     TooManyFds,
     Unexpected,
 };
+
+/// Default send and receive timeout for the blocking connect and auth phase.
+pub const default_connect_timeout_ms: u32 = 1000;
 
 /// Max fds carried in a single message's ancillary data.
 pub const max_fds = 16;
@@ -61,12 +65,24 @@ pub const Transport = struct {
     }
 
     /// Connect a stream unix socket. `abstract` selects the Linux abstract
-    /// namespace (leading NUL) instead of a filesystem path.
+    /// namespace (leading NUL) instead of a filesystem path. The connect and the
+    /// later blocking reads and writes give up after `default_connect_timeout_ms`.
+    /// The caller clears the timeouts with `setTimeouts(fd, 0)` when the blocking
+    /// phase is over.
     pub fn connectUnix(path: []const u8, abstract: bool) Error!Transport {
+        return connectUnixTimeout(path, abstract, default_connect_timeout_ms);
+    }
+
+    /// Like `connectUnix` with an explicit timeout in milliseconds. A connect
+    /// that waits longer than `timeout_ms` (for example on a full backlog)
+    /// returns `error.Timeout`. The caller clears the timeouts with
+    /// `setTimeouts(fd, 0)` when the blocking phase is over.
+    pub fn connectUnixTimeout(path: []const u8, abstract: bool, timeout_ms: u32) Error!Transport {
         const s = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
         _ = try check(s);
         const fd: i32 = @intCast(s);
         errdefer _ = linux.close(fd);
+        try setTimeouts(fd, timeout_ms);
 
         var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
         const path_off = @offsetOf(linux.sockaddr.un, "path");
@@ -83,8 +99,16 @@ pub const Transport = struct {
             namelen += path.len + 1;
         }
         const rc = linux.connect(fd, @ptrCast(&addr), @intCast(namelen));
-        _ = check(rc) catch return Error.ConnectFailed;
+        _ = check(rc) catch |e| return if (e == Error.WouldBlock) Error.Timeout else Error.ConnectFailed;
         return .{ .fd = fd };
+    }
+
+    /// Set SO_SNDTIMEO and SO_RCVTIMEO. A `ms` of 0 means no timeout.
+    pub fn setTimeouts(fd: i32, ms: u32) Error!void {
+        const tv = linux.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+        const bytes = std.mem.asBytes(&tv);
+        _ = try check(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, bytes.ptr, bytes.len));
+        _ = try check(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, bytes.ptr, bytes.len));
     }
 
     pub fn setNonblock(self: *Transport, on: bool) Error!void {
@@ -236,4 +260,61 @@ test "pass a file descriptor over SCM_RIGHTS" {
     var buf2: [8]u8 = undefined;
     const n = try recv_end.read(buf2[0..]);
     try testing.expectEqualStrings("z", buf2[0..n]);
+}
+
+test "connect to a full backlog times out" {
+    const fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expect(posix.errno(fd) == .SUCCESS);
+    const lfd: i32 = @intCast(fd);
+    defer _ = linux.close(lfd);
+
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "dbuszig-backlog-{d}", .{linux.getpid()});
+    addr.path[0] = 0;
+    @memcpy(addr.path[1 .. 1 + name.len], name);
+    const len = @offsetOf(linux.sockaddr.un, "path") + 1 + name.len;
+    try testing.expect(posix.errno(linux.bind(lfd, @ptrCast(&addr), @intCast(len))) == .SUCCESS);
+    try testing.expect(posix.errno(linux.listen(lfd, 0)) == .SUCCESS);
+
+    // Nothing accepts, so the first connects stay queued and a later one blocks.
+    var held: [2]Transport = undefined;
+    var n_held: usize = 0;
+    defer for (held[0..n_held]) |*h| h.close();
+    var timed_out = false;
+    var tries: usize = 0;
+    while (tries < 4) : (tries += 1) {
+        const t0 = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+        if (Transport.connectUnixTimeout(name, true, 200)) |t| {
+            if (n_held < held.len) {
+                held[n_held] = t;
+                n_held += 1;
+            } else {
+                var tt = t;
+                tt.close();
+            }
+        } else |e| {
+            try testing.expectEqual(Error.Timeout, e);
+            const dt = std.Io.Clock.awake.now(testing.io).toMilliseconds() - t0;
+            try testing.expect(dt >= 150 and dt < 1500);
+            timed_out = true;
+            break;
+        }
+    }
+    try testing.expect(timed_out);
+}
+
+test "setTimeouts sets send and receive timeouts" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(posix.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) == .SUCCESS);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    try Transport.setTimeouts(fds[0], 1500);
+    inline for (.{ linux.SO.SNDTIMEO, linux.SO.RCVTIMEO }) |opt| {
+        var tv: linux.timeval = undefined;
+        var l: linux.socklen_t = @sizeOf(linux.timeval);
+        try testing.expect(posix.errno(linux.getsockopt(fds[0], linux.SOL.SOCKET, opt, std.mem.asBytes(&tv).ptr, &l)) == .SUCCESS);
+        try testing.expectEqual(@as(@TypeOf(tv.sec), 1), tv.sec);
+        try testing.expectEqual(@as(@TypeOf(tv.usec), 500_000), tv.usec);
+    }
 }

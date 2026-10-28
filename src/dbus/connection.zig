@@ -155,7 +155,7 @@ pub const Connection = struct {
         self.processIncoming();
     }
 
-    fn processIncoming(self: *Connection) void {
+    pub fn processIncoming(self: *Connection) void {
         while (true) {
             const total = message.wireLength(self.in_buf.items) orelse {
                 // Enough bytes to know the length but none returned means a bad

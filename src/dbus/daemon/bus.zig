@@ -259,6 +259,7 @@ pub const Daemon = struct {
 
         try client.conn.register();
         try client.conn.addFilter(clientFilter, client);
+        if (client.conn.in_buf.items.len > 0) client.conn.processIncoming();
     }
 
     fn destroyClient(self: *Daemon, client: *Client) void {
@@ -624,6 +625,15 @@ test "our client connects to our daemon and Hello works" {
     const uname = client_bus.unique_name.?;
     try testing.expect(uname.len >= 3);
     try testing.expectEqual(@as(u8, ':'), uname[0]);
+
+    // The setup timeouts are cleared once Hello succeeds.
+    inline for (.{ linux.SO.SNDTIMEO, linux.SO.RCVTIMEO }) |opt| {
+        var tv: linux.timeval = undefined;
+        var l: linux.socklen_t = @sizeOf(linux.timeval);
+        try testing.expect(posix.errno(linux.getsockopt(client_bus.conn.transport.fd, linux.SOL.SOCKET, opt, std.mem.asBytes(&tv).ptr, &l)) == .SUCCESS);
+        try testing.expectEqual(@as(@TypeOf(tv.sec), 0), tv.sec);
+        try testing.expectEqual(@as(@TypeOf(tv.usec), 0), tv.usec);
+    }
 }
 
 test "two clients route a call and a signal through our daemon" {
@@ -792,4 +802,71 @@ test "policy denies owning a reserved name" {
     try requestName(a, &cloop, "com.allowed.Name", &allowed);
     try testing.expect(!allowed.is_error);
     try testing.expectEqual(@as(u32, 1), allowed.value); // primary owner
+}
+
+test "Hello sent in the same write as BEGIN gets a reply" {
+    var dgpa_state = std.heap.DebugAllocator(.{}){};
+    defer _ = dgpa_state.deinit();
+    const dgpa = dgpa_state.allocator();
+
+    var dloop = try el.EventLoop.init(dgpa);
+    defer dloop.deinit();
+    var diot: std.Io.Threaded = .init(dgpa, .{});
+    defer diot.deinit();
+    const d = try Daemon.init(dgpa, &dloop, diot.io());
+    defer d.deinit();
+
+    var name_buf: [64]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&name_buf, "dbuszig-begin-{d}", .{linux.getpid()});
+    try d.listenUnix(sock, true);
+    const thread = try std.Thread.spawn(.{}, daemonThread, .{d});
+    defer {
+        d.stop();
+        thread.join();
+    }
+
+    var hello_bytes: std.ArrayList(u8) = .empty;
+    defer hello_bytes.deinit(testing.allocator);
+    const hello = Message{
+        .msg_type = .method_call,
+        .serial = 1,
+        .path = "/org/freedesktop/DBus",
+        .interface = "org.freedesktop.DBus",
+        .member = "Hello",
+        .destination = "org.freedesktop.DBus",
+    };
+    try hello.serialize(testing.allocator, &hello_bytes, .little);
+
+    var uid_dec: [16]u8 = undefined;
+    const uid_str = try std.fmt.bufPrint(&uid_dec, "{d}", .{linux.getuid()});
+    var auth_line: [64]u8 = undefined;
+    const auth_bytes = try std.fmt.bufPrint(&auth_line, "\x00AUTH EXTERNAL {x}\r\n", .{uid_str});
+
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var t = try Transport.connectUnix(sock, true);
+        defer t.close();
+
+        _ = try t.write(auth_bytes);
+        var got: [256]u8 = undefined;
+        var n: usize = 0;
+        while (std.mem.indexOf(u8, got[0..n], "\r\n") == null) n += try t.read(got[n..]);
+        try testing.expect(std.mem.startsWith(u8, got[0..n], "OK "));
+
+        // BEGIN and the first message go out in one write, so the daemon reads
+        // both with the same read call.
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try out.appendSlice(testing.allocator, "BEGIN\r\n");
+        try out.appendSlice(testing.allocator, hello_bytes.items);
+        _ = try t.write(out.items);
+
+        var rbuf: [512]u8 = undefined;
+        var rn: usize = 0;
+        while (message.wireLength(rbuf[0..rn]) == null or message.wireLength(rbuf[0..rn]).? > rn) {
+            rn += try t.read(rbuf[rn..]);
+        }
+        const reply = try Message.deserialize(testing.allocator, rbuf[0..rn]);
+        try testing.expectEqual(message.MessageType.method_return, reply.msg_type);
+    }
 }

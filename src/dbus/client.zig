@@ -76,6 +76,7 @@ pub const Bus = struct {
         if (leftover.items.len > 0) try self.conn.in_buf.appendSlice(gpa, leftover.items);
         try self.conn.register();
         try self.conn.addFilter(busFilter, self);
+        if (self.conn.in_buf.items.len > 0) self.conn.processIncoming();
 
         const hello = Message{
             .msg_type = .method_call,
@@ -92,6 +93,8 @@ pub const Bus = struct {
             _ = loop.dispatch(50);
         }
         if (!self.hello_done or self.unique_name == null) return Error.HelloFailed;
+        // The connect timeouts only cover the setup. Normal traffic has none.
+        try Transport.setTimeouts(self.conn.transport.fd, 0);
         return self;
     }
 
